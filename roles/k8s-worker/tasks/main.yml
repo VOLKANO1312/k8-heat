@@ -1,0 +1,48 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for k8s-worker
+- name: Add k8s GPG
+  shell: |
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key |
+    gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Add k8s repo
+  shell: |
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
+    https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /" \
+    > /etc/apt/sources.list.d/kubernetes.list
+
+- name: Install kubeadm kubelet
+  apt:
+    update_cache: yes
+    name:
+      - kubelet
+      - kubeadm
+    state: present
+
+- name: Check already joined
+  stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: joined
+
+- name: Fetch join script
+  fetch:
+    src: /home/ubuntu/k8s-join-command.sh
+    dest: /tmp/k8s-join-command.sh
+    flat: yes
+  delegate_to: k8s-master
+  when: not joined.stat.exists
+
+- name: Copy join script
+  copy:
+    src: /tmp/k8s-join-command.sh
+    dest: /home/ubuntu/k8s-join-command.sh
+    mode: '0755'
+  when: not joined.stat.exists
+
+- name: Join cluster
+  shell: /home/ubuntu/k8s-join-command.sh
+  when: not joined.stat.exists
+

@@ -1,0 +1,22 @@
+- hosts: all
+  become: yes
+  roles:
+    - common
+    - container-runtime
+
+- hosts: k8s_master
+  become: yes
+  roles:
+    - k8s-master
+    - cni-flannel
+
+- hosts: k8s_workers
+  become: yes
+  roles:
+    - k8s-worker
+
+- hosts: k8s_master
+  become: yes
+  roles:
+    - apps-nginx
+
