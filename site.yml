@@ -19,4 +19,6 @@
   become: yes
   roles:
     - apps-nginx
+    - { role: monitoring, tags: monitoring }
+
 
