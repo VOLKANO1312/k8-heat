@@ -1,0 +1,483 @@
+---
+- name: Installation et configuration complète de Kubernetes Master avec Docker
+  hosts: k8s_master
+  become: yes
+  vars:
+    k8s_ver: "{{ k8s_version | default('1.29') }}"
+    master_address: "{{ master_ip | default('192.168.1.236') }}"
+    pod_cidr: "{{ pod_network_cidr | default('10.244.0.0/16') }}"
+    
+  tasks:
+    # ============================================================
+    # ÉTAPE 1: PRÉPARATION DU SYSTÈME
+    # ============================================================
+    
+    - name: Mettre à jour le cache APT
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Installer les dépendances de base
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+          - wget
+        state: present
+
+    - name: Désactiver le swap immédiatement
+      shell: swapoff -a
+      
+    - name: Désactiver le swap de façon permanente dans /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+
+    - name: Charger les modules kernel nécessaires
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Rendre les modules persistants au redémarrage
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Configurer les paramètres sysctl pour Kubernetes
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/k8s.conf
+        reload: yes
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+
+    # ============================================================
+    # ÉTAPE 2: INSTALLATION DE DOCKER
+    # ============================================================
+
+    - name: Supprimer les anciennes versions de Docker (si présentes)
+      apt:
+        name:
+          - docker
+          - docker-engine
+          - docker.io
+          - containerd
+          - runc
+        state: absent
+
+    - name: Créer le répertoire pour les clés GPG
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Ajouter la clé GPG officielle de Docker
+      shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Ajouter le repository Docker
+      shell: |
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+
+    - name: Mettre à jour le cache APT après ajout du repo Docker
+      apt:
+        update_cache: yes
+
+    - name: Installer Docker Engine
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Créer le répertoire de configuration Docker
+      file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+
+    - name: Configurer Docker pour utiliser systemd comme cgroup driver
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "100m"
+            },
+            "storage-driver": "overlay2"
+          }
+        mode: '0644'
+
+    - name: Créer le répertoire systemd pour Docker
+      file:
+        path: /etc/systemd/system/docker.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Recharger systemd et redémarrer Docker
+      systemd:
+        daemon_reload: yes
+        name: docker
+        state: restarted
+        enabled: yes
+
+    - name: Ajouter l'utilisateur au groupe docker
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+
+    # ============================================================
+    # ÉTAPE 3: INSTALLATION DE KUBERNETES (kubeadm, kubelet, kubectl)
+    # ============================================================
+
+    - name: Ajouter la clé GPG de Kubernetes
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_ver }}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Ajouter le repository Kubernetes
+      shell: |
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_ver }}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+      args:
+        creates: /etc/apt/sources.list.d/kubernetes.list
+
+    - name: Mettre à jour le cache APT après ajout du repo Kubernetes
+      apt:
+        update_cache: yes
+
+    - name: Installer kubeadm, kubelet et kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Bloquer les mises à jour automatiques de Kubernetes
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Activer et démarrer kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+
+    # ============================================================
+    # ÉTAPE 4: CONFIGURATION DE CONTAINERD POUR DOCKER
+    # ============================================================
+
+    - name: Arrêter containerd avant reconfiguration
+      systemd:
+        name: containerd
+        state: stopped
+
+    - name: Créer le répertoire de configuration containerd
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Supprimer l'ancienne configuration de containerd
+      file:
+        path: /etc/containerd/config.toml
+        state: absent
+
+    - name: Générer la configuration par défaut de containerd
+      shell: containerd config default > /etc/containerd/config.toml
+
+    - name: Configurer containerd pour utiliser systemd cgroup driver
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Redémarrer containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    - name: Attendre que containerd soit prêt
+      wait_for:
+        path: /var/run/containerd/containerd.sock
+        timeout: 30
+
+    - name: Vérifier que containerd fonctionne correctement
+      shell: crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock version
+      register: containerd_check
+      failed_when: containerd_check.rc != 0
+
+    - name: Afficher la version de containerd
+      debug:
+        msg: "{{ containerd_check.stdout_lines }}"
+
+    # ============================================================
+    # ÉTAPE 5: INITIALISATION DU CLUSTER KUBERNETES MASTER
+    # ============================================================
+
+    - name: Vérifier si le cluster est déjà initialisé
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_admin_conf
+
+    - name: Vérifier le nombre de CPUs disponibles
+      shell: nproc
+      register: cpu_count
+
+    - name: Afficher le nombre de CPUs
+      debug:
+        msg: "CPUs disponibles: {{ cpu_count.stdout }}"
+
+    - name: Initialiser le cluster Kubernetes avec kubeadm (avec 2+ CPUs)
+      shell: |
+        kubeadm init \
+          --apiserver-advertise-address={{ master_address }} \
+          --pod-network-cidr={{ pod_cidr }} \
+          --cri-socket unix:///var/run/containerd/containerd.sock
+      when: 
+        - not k8s_admin_conf.stat.exists
+        - cpu_count.stdout | int >= 2
+      register: kubeadm_init
+
+    - name: Initialiser le cluster Kubernetes avec kubeadm (avec 1 CPU - ignorer l'avertissement)
+      shell: |
+        kubeadm init \
+          --apiserver-advertise-address={{ master_address }} \
+          --pod-network-cidr={{ pod_cidr }} \
+          --cri-socket unix:///var/run/containerd/containerd.sock \
+          --ignore-preflight-errors=NumCPU
+      when: 
+        - not k8s_admin_conf.stat.exists
+        - cpu_count.stdout | int < 2
+      register: kubeadm_init
+
+    - name: Afficher le résultat de l'initialisation
+      debug:
+        var: kubeadm_init.stdout_lines
+      when: kubeadm_init is defined and kubeadm_init.changed
+
+    # ============================================================
+    # ÉTAPE 6: CONFIGURATION DE KUBECTL POUR L'UTILISATEUR
+    # ============================================================
+
+    - name: Créer le répertoire .kube pour l'utilisateur
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Copier le fichier de configuration kubectl pour l'utilisateur
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+
+    - name: Créer le répertoire .kube pour root
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0755'
+
+    - name: Copier le fichier de configuration kubectl pour root
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        mode: '0600'
+
+# ============================================================
+    # ÉTAPE 7: INSTALLATION DU PLUGIN RÉSEAU (Flannel)
+    # ============================================================
+
+    - name: Vérifier si Flannel est déjà installé
+      shell: kubectl get namespace kube-flannel
+      register: flannel_namespace
+      failed_when: false
+      become_user: "{{ ansible_user }}"
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+
+    - name: Télécharger le manifest Flannel
+      get_url:
+        url: https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+        dest: /tmp/kube-flannel.yml
+        mode: '0644'
+      when: flannel_namespace.rc != 0
+
+    - name: Appliquer le plugin réseau Flannel
+      become_user: "{{ ansible_user }}"
+      shell: kubectl apply -f /tmp/kube-flannel.yml
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      when: flannel_namespace.rc != 0
+      register: flannel_apply
+
+    - name: Afficher le résultat de l'installation Flannel
+      debug:
+        msg: "{{ flannel_apply.stdout_lines }}"
+      when: flannel_apply is defined and flannel_apply.changed
+
+    - name: Attendre 30 secondes que Flannel démarre
+      pause:
+        seconds: 30
+      when: flannel_namespace.rc != 0
+
+    - name: Vérifier l'état des pods Flannel
+      shell: kubectl get pods -n kube-flannel -o wide
+      register: flannel_pods
+      become_user: "{{ ansible_user }}"
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+
+    - name: Afficher l'état des pods Flannel
+      debug:
+        msg: "{{ flannel_pods.stdout_lines }}"
+
+    - name: Vérifier le DaemonSet Flannel
+      shell: kubectl get daemonsets -n kube-flannel
+      register: flannel_daemonset
+      become_user: "{{ ansible_user }}"
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+
+    - name: Afficher le DaemonSet Flannel
+      debug:
+        msg: "{{ flannel_daemonset.stdout_lines }}"
+
+    - name: Vérifier que le node Master passe en Ready
+      shell: kubectl get nodes
+      register: node_status_flannel
+      become_user: "{{ ansible_user }}"
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+
+    - name: Afficher l'état du node après Flannel
+      debug:
+        msg: "{{ node_status_flannel.stdout_lines }}"
+
+    # ============================================================
+    # ÉTAPE 8: GÉNÉRER LA COMMANDE JOIN POUR LES WORKERS
+    # ============================================================
+
+    - name: Générer la commande join pour les workers
+      shell: kubeadm token create --print-join-command
+      register: join_command_output
+
+    - name: Sauvegarder la commande join dans un fichier
+      copy:
+        content: "{{ join_command_output.stdout }}"
+        dest: /home/{{ ansible_user }}/k8s-join-command.sh
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Afficher la commande join pour les workers
+      debug:
+        msg: 
+          - "=========================================="
+          - "Commande pour joindre les workers:"
+          - "{{ join_command_output.stdout }}"
+          - "=========================================="
+          - "Cette commande a été sauvegardée dans: /home/{{ ansible_user }}/k8s-join-command.sh"
+
+    # ============================================================
+    # ÉTAPE 9: VÉRIFICATIONS FINALES
+    # ============================================================
+
+    - name: Attendre que tous les composants du control plane soient prêts
+      shell: kubectl get pods -n kube-system -o jsonpath='{.items[*].status.phase}' | grep -v Running
+      register: pending_pods
+      until: pending_pods.stdout == ""
+      retries: 30
+      delay: 10
+      failed_when: false
+      become_user: "{{ ansible_user }}"
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+
+    - name: Vérifier l'état du node Master
+      shell: kubectl get nodes
+      register: node_status
+      become_user: "{{ ansible_user }}"
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+
+    - name: Afficher l'état du node Master
+      debug:
+        msg: "{{ node_status.stdout_lines }}"
+
+    - name: Récupérer les informations du cluster
+      shell: kubectl cluster-info
+      register: cluster_info
+      become_user: "{{ ansible_user }}"
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+
+    - name: Afficher les informations du cluster
+      debug:
+        msg: "{{ cluster_info.stdout_lines }}"
+
+    # ============================================================
+    # RÉCAPITULATIF FINAL
+    # ============================================================
+
+    - name: Afficher le récapitulatif de l'installation
+      debug:
+        msg:
+          - "=========================================="
+          - "Installation de Kubernetes Master terminée avec succès!"
+          - "=========================================="
+          - "Configuration:"
+          - "  - Master IP: {{ master_address }}"
+          - "  - Pod Network CIDR: {{ pod_cidr }}"
+          - "  - CPUs: {{ cpu_count.stdout }}"
+          - "  - Container Runtime: Docker + containerd"
+          - "  - Network Plugin: Flannel"
+          - ""
+          - "Fichiers importants:"
+          - "  - Config kubectl: /home/{{ ansible_user }}/.kube/config"
+          - "  - Join command: /home/{{ ansible_user }}/k8s-join-command.sh"
+          - ""
+          - "Prochaines étapes:"
+          - "  1. Connectez-vous au Master: ssh {{ ansible_user }}@{{ ansible_host }}"
+          - "  2. Vérifiez le cluster: kubectl get nodes"
+          - "  3. Utilisez la commande join pour ajouter des workers"
+          - "=========================================="

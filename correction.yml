@@ -1,0 +1,116 @@
+---
+- name: Diagnostic et correction du firewall sur le Master
+  hosts: k8s_master
+  become: yes
+  
+  tasks:
+    - name: Vérifier si l'API server écoute sur le port 6443
+      shell: ss -tlnp | grep 6443
+      register: api_listening
+      failed_when: false
+      
+    - name: Afficher les processus écoutant sur 6443
+      debug:
+        var: api_listening.stdout_lines
+        
+    - name: Vérifier si l'API écoute sur toutes les interfaces
+      shell: netstat -tlnp | grep 6443 | grep -v "127.0.0.1"
+      register: api_external
+      failed_when: false
+      
+    - name: Afficher le statut
+      debug:
+        msg: |
+          {% if api_external.rc == 0 %}
+          ✓ L'API server écoute sur l'interface externe
+          {% else %}
+          ✗ L'API server n'écoute que sur localhost
+          {% endif %}
+          
+    - name: Vérifier le statut du firewall UFW
+      shell: ufw status
+      register: ufw_status
+      failed_when: false
+      
+    - name: Afficher le statut UFW
+      debug:
+        var: ufw_status.stdout_lines
+        
+    - name: Désactiver UFW temporairement pour test
+      ufw:
+        state: disabled
+      register: ufw_disabled
+      
+    - name: Afficher le résultat
+      debug:
+        msg: "UFW désactivé pour permettre le test de connectivité"
+      when: ufw_disabled.changed
+      
+    - name: Alternative - Ouvrir les ports Kubernetes dans UFW
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - 6443    # API server
+        - 2379    # etcd client
+        - 2380    # etcd peer
+        - 10250   # kubelet
+        - 10251   # kube-scheduler
+        - 10252   # kube-controller-manager
+      when: false  # Désactivé par défaut, mettre à true si vous voulez garder UFW actif
+      
+    - name: Vérifier les règles iptables
+      shell: iptables -L -n | grep 6443
+      register: iptables_rules
+      failed_when: false
+      
+    - name: Afficher les règles iptables pour 6443
+      debug:
+        var: iptables_rules.stdout_lines
+        
+    - name: Vérifier que kube-apiserver fonctionne
+      shell: kubectl cluster-info
+      become_user: ubuntu
+      register: cluster_info
+      failed_when: false
+      
+    - name: Afficher les infos du cluster
+      debug:
+        var: cluster_info.stdout_lines
+
+- name: Test de connectivité depuis le worker
+  hosts: k8s_workers
+  become: yes
+  
+  tasks:
+    - name: Attendre 5 secondes après modification du firewall
+      pause:
+        seconds: 5
+        
+    - name: Tester la connectivité au port 6443
+      wait_for:
+        host: "{{ hostvars['k8s-master']['master_ip'] }}"
+        port: 6443
+        timeout: 10
+      register: port_test
+      failed_when: false
+      
+    - name: Afficher le résultat du test
+      debug:
+        msg: |
+          {% if port_test.failed %}
+          ✗ Port 6443 toujours inaccessible
+          {% else %}
+          ✓ Port 6443 accessible!
+          {% endif %}
+          
+    - name: Test avec curl
+      shell: curl -k https://{{ hostvars['k8s-master']['master_ip'] }}:6443/version --connect-timeout 5
+      register: curl_test
+      failed_when: false
+      
+    - name: Afficher le résultat curl
+      debug:
+        var: curl_test.stdout
+      when: curl_test.rc == 0

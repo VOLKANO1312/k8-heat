@@ -1,0 +1,87 @@
+---
+- name: Correction complète du réseau Kubernetes
+  hosts: k8s_master
+  become: yes
+  
+  tasks:
+    - name: "🔍 DIAGNOSTIC - Vérifier l'API server"
+      shell: ss -tlnp | grep 6443
+      register: api_check
+      
+    - name: Afficher le statut de l'API
+      debug:
+        msg: "{{ api_check.stdout_lines }}"
+        
+    - name: "🔥 FIREWALL - Désactiver UFW"
+      shell: |
+        ufw --force disable
+        systemctl stop ufw
+      register: firewall_disabled
+      
+    - name: Confirmer désactivation du firewall
+      debug:
+        msg: "✓ Firewall UFW désactivé"
+        
+    - name: "📋 IPTABLES - Accepter tout le trafic vers 6443"
+      shell: |
+        iptables -I INPUT -p tcp --dport 6443 -j ACCEPT
+        iptables -I INPUT -p tcp --dport 10250 -j ACCEPT
+      
+    - name: "🔄 KUBERNETES - Redémarrer kube-apiserver si nécessaire"
+      shell: |
+        kubectl get nodes
+      become_user: ubuntu
+      register: k8s_test
+      failed_when: false
+      
+    - name: Afficher le statut Kubernetes
+      debug:
+        msg: "{{ k8s_test.stdout_lines if k8s_test.rc == 0 else 'Kubernetes API non accessible' }}"
+
+- name: "✅ TEST - Vérifier la connectivité depuis le worker"
+  hosts: k8s_workers
+  become: yes
+  
+  tasks:
+    - name: Attendre 3 secondes
+      pause:
+        seconds: 3
+        
+    - name: "🌐 PING - Test connectivité réseau"
+      shell: ping -c 2 {{ hostvars['k8s-master']['master_ip'] }}
+      register: ping_test
+      
+    - name: "🔌 PORT - Test port 6443 avec netcat"
+      shell: timeout 5 bash -c 'cat < /dev/null > /dev/tcp/{{ hostvars["k8s-master"]["master_ip"] }}/6443' && echo "SUCCESS" || echo "FAILED"
+      register: port_test
+      
+    - name: Afficher le résultat
+      debug:
+        msg: |
+          Ping: {{ 'OK' if ping_test.rc == 0 else 'FAILED' }}
+          Port 6443: {{ port_test.stdout }}
+          
+    - name: "🌐 CURL - Test API avec curl"
+      shell: curl -k https://{{ hostvars['k8s-master']['master_ip'] }}:6443/version --connect-timeout 5
+      register: curl_test
+      failed_when: false
+      
+    - name: Afficher réponse API
+      debug:
+        var: curl_test.stdout
+      when: curl_test.rc == 0
+      
+    - name: "📊 RÉSULTAT FINAL"
+      debug:
+        msg: |
+          {% if curl_test.rc == 0 %}
+          ✅ SUCCESS: L'API Kubernetes est accessible depuis le worker!
+          Vous pouvez maintenant joindre le worker au cluster.
+          {% else %}
+          ❌ FAILED: L'API Kubernetes n'est toujours pas accessible.
+          
+          ACTIONS REQUISES:
+          1. Vérifiez les Security Groups dans OpenStack
+          2. Assurez-vous que le port 6443 est ouvert entre 172.16.1.0/24
+          3. Vérifiez que l'instance master n'a pas de firewall au niveau cloud
+          {% endif %}

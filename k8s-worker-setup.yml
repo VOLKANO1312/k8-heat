@@ -1,0 +1,298 @@
+---
+- name: Installation et configuration Kubernetes Worker avec Docker
+  hosts: k8s_workers
+  become: yes
+  vars:
+    k8s_ver: "{{ k8s_version | default('1.29') }}"
+
+  tasks:
+    # ============================================================
+    # ÉTAPE 1 : PRÉPARATION DU SYSTÈME
+    # ============================================================
+
+    - name: Mettre à jour le cache APT
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Installer les dépendances de base
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+        state: present
+
+    - name: Désactiver le swap immédiatement
+      shell: swapoff -a
+
+    - name: Désactiver le swap de façon permanente
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+
+    - name: Charger les modules kernel nécessaires
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Rendre les modules persistants
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Configurer sysctl pour Kubernetes
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/k8s.conf
+        reload: yes
+      loop:
+        - { name: net.bridge.bridge-nf-call-iptables, value: 1 }
+        - { name: net.bridge.bridge-nf-call-ip6tables, value: 1 }
+        - { name: net.ipv4.ip_forward, value: 1 }
+
+    # ============================================================
+    # ÉTAPE 2 : INSTALLATION DE DOCKER
+    # ============================================================
+
+    - name: Supprimer anciennes versions Docker
+      apt:
+        name:
+          - docker
+          - docker-engine
+          - docker.io
+          - containerd
+          - runc
+        state: absent
+
+    - name: Créer le répertoire keyrings
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Ajouter la clé GPG Docker
+      shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Ajouter le repository Docker
+      shell: |
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+        https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+        > /etc/apt/sources.list.d/docker.list
+
+    - name: Installer Docker
+      apt:
+        update_cache: yes
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+
+    - name: Configurer Docker (systemd cgroup)
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "storage-driver": "overlay2"
+          }
+
+    - name: Redémarrer Docker
+      systemd:
+        name: docker
+        state: restarted
+        enabled: yes
+
+    # ============================================================
+    # ÉTAPE 3 : INSTALLATION DE KUBERNETES
+    # ============================================================
+
+    - name: Ajouter la clé GPG Kubernetes
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_ver }}/deb/Release.key \
+        | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Ajouter le repository Kubernetes
+      shell: |
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
+        https://pkgs.k8s.io/core:/stable:/v{{ k8s_ver }}/deb/ /" \
+        > /etc/apt/sources.list.d/kubernetes.list
+
+    - name: Installer kubeadm et kubelet
+      apt:
+        update_cache: yes
+        name:
+          - kubelet
+          - kubeadm
+        state: present
+
+    - name: Bloquer les mises à jour Kubernetes
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+
+    # ============================================================
+    # ÉTAPE 3.5 : CONFIGURATION DE CONTAINERD POUR KUBERNETES
+    # ============================================================
+
+    - name: Arrêter containerd avant reconfiguration
+      systemd:
+        name: containerd
+        state: stopped
+
+    - name: Supprimer l'ancienne configuration containerd
+      file:
+        path: /etc/containerd/config.toml
+        state: absent
+
+    - name: Créer le répertoire de configuration containerd
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Générer et configurer containerd pour Kubernetes
+      shell: |
+        containerd config default | sed 's/SystemdCgroup = false/SystemdCgroup = true/g' > /etc/containerd/config.toml
+
+    - name: Vérifier la configuration SystemdCgroup
+      shell: grep "SystemdCgroup = true" /etc/containerd/config.toml
+      register: cgroup_check
+      failed_when: cgroup_check.rc != 0
+
+    - name: Redémarrer containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Attendre que containerd soit prêt
+      wait_for:
+        path: /var/run/containerd/containerd.sock
+        state: present
+        timeout: 30
+
+    # ============================================================
+    # ÉTAPE 4 : VÉRIFICATION DE LA CONNECTIVITÉ RÉSEAU
+    # ============================================================
+
+    - name: Obtenir l'IP interne du worker
+      shell: ip addr show ens3 | grep "inet " | grep "172.16.1" | awk '{print $2}' | cut -d/ -f1
+      register: worker_internal_ip_detected
+      
+    - name: Afficher l'IP interne détectée
+      debug:
+        msg: "IP interne du worker: {{ worker_internal_ip_detected.stdout }}"
+
+    - name: Vérifier la connectivité vers le master (IP interne)
+      shell: ping -c 3 {{ hostvars['k8s-master']['master_ip'] }}
+      register: ping_result
+      failed_when: ping_result.rc != 0
+
+    - name: Vérifier l'accès à l'API server (port 6443)
+      wait_for:
+        host: "{{ hostvars['k8s-master']['master_ip'] }}"
+        port: 6443
+        timeout: 10
+
+    # ============================================================
+    # ÉTAPE 5 : JOIN AU CLUSTER
+    # ============================================================
+
+    - name: Copier la commande join depuis le master
+      fetch:
+        src: /home/ubuntu/k8s-join-command.sh
+        dest: /tmp/k8s-join-command.sh
+        flat: yes
+      delegate_to: k8s-master
+      become: no
+
+    - name: Copier la commande join sur le worker
+      copy:
+        src: /tmp/k8s-join-command.sh
+        dest: /home/ubuntu/k8s-join-command.sh
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Vérifier si le worker est déjà joint
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: worker_joined
+
+    - name: Joindre le worker au cluster
+      shell: /home/ubuntu/k8s-join-command.sh
+      when: not worker_joined.stat.exists
+      register: join_result
+
+    - name: Afficher le résultat du join
+      debug:
+        var: join_result.stdout_lines
+      when: not worker_joined.stat.exists and join_result is defined
+
+    - name: Afficher le statut final
+      debug:
+        msg: "✓ Worker joint au cluster avec succès!"
+      when: join_result is defined and join_result.rc == 0
+
+# ============================================================
+# VÉRIFICATION SUR LE MASTER
+# ============================================================
+
+- name: Vérifier le statut du cluster sur le master
+  hosts: k8s_master
+  become: yes
+  
+  tasks:
+    - name: Attendre que le worker soit visible dans le cluster
+      pause:
+        seconds: 15
+        
+    - name: Vérifier les nœuds du cluster
+      shell: kubectl get nodes -o wide
+      become_user: ubuntu
+      register: nodes_status
+      
+    - name: Afficher les nœuds
+      debug:
+        var: nodes_status.stdout_lines
+        
+    - name: Attendre que le worker soit Ready
+      shell: kubectl get nodes | grep -i hibouta | grep -i ready
+      become_user: ubuntu
+      register: worker_ready
+      retries: 20
+      delay: 5
+      until: worker_ready.rc == 0
+      failed_when: false
+      
+    - name: Afficher le statut final du worker
+      debug:
+        msg: |
+          {% if worker_ready.rc == 0 %}
+          ✓ SUCCESS: Le worker 'Hibouta' est maintenant Ready dans le cluster!
+          {% else %}
+          ⚠ Le worker est joint mais pas encore Ready. Vérifiez avec: kubectl get nodes
+          {% endif %}

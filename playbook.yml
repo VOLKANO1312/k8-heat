@@ -1,0 +1,8 @@
+- name: Test Ansible
+  hosts: Yassine
+  become: yes
+  tasks:
+    - name: Create file
+      file:
+        path: /home/ubuntu/test.txt
+        state: touch

@@ -1,0 +1,40 @@
+---
+# ============================================================
+# PLAYBOOK ORCHESTRATEUR
+# Ce playbook exécute automatiquement :
+# 1. Le playbook master (inchangé)
+# 2. Récupère la commande join
+# 3. Le playbook worker avec la commande join automatique
+# ============================================================
+
+# PLAY 1: Exécuter le playbook Master (tel quel)
+- import_playbook: config-k8-master.yml
+
+# PLAY 2: Récupérer la commande join depuis le Master
+- name: Récupération automatique de la commande join
+  hosts: k8s_master
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Générer la commande join
+      shell: kubeadm token create --print-join-command
+      register: master_join_command
+      
+    - name: Sauvegarder la commande join comme variable globale
+      set_fact:
+        cluster_join_command: "{{ master_join_command.stdout }}"
+      delegate_to: localhost
+      delegate_facts: yes
+      
+    - name: Afficher la commande join récupérée
+      debug:
+        msg: 
+          - "=========================================="
+          - "Commande join récupérée automatiquement:"
+          - "{{ master_join_command.stdout }}"
+          - "=========================================="
+
+# PLAY 3: Exécuter le playbook Worker avec la commande join
+- import_playbook: k8s-worker-setup.yml
+  vars:
+    join_command: "{{ hostvars['localhost']['cluster_join_command'] }}"
